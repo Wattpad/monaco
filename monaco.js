@@ -37,10 +37,13 @@
         return child;
     };
 
-    Monaco.fetchCollections = function(collections, callbacks) {
-        var allResponses = {};
-        var requestQueue = [];
+    Monaco.fetchCollections = function(collections, groupOptions) {
+        var allResponses = {},
+            requestQueue = [],
+            success = groupOptions.success,
+            errror = groupOptions.error;
 
+        // success and error callbacks of each collection.fetch calls
         var complete = function(collection, resp, options) {
             allResponses[collection.resource] = {
                 collection: collection,
@@ -58,8 +61,8 @@
                     req.abort();
                 }, this);
 
-                if (callbacks.error) {
-                    callbacks.error(collection, resp);
+                if (error) {
+                    return error(collection, resp);
                 }
 
             // success
@@ -67,17 +70,24 @@
                 requestQueue = _.filter(requestQueue, function(item) { 
                     return (item.resource !== collection.resource);
                 });
-                if (_.size(requestQueue) <= 0 && callbacks.success) {
-                    callbacks.success(allResponses);
+                if (_.size(requestQueue) <= 0 && success) {
+                    return success(allResponses);
                 }
             }
         };
 
+        groupOptions.success = complete;
+        groupOptions.error = complete;
+
+        var cid = _.uniqueId('mf-'),
+            mfId = cid+'|'+_.size(collections);
+
         _.each(collections, function(collection, index, collections) {
-            requestQueue.push(collection.fetch({
-                success : complete,
-                error : complete
-            }));
+            var fetchOptions = _.clone(groupOptions);
+            fetchOptions.multiFetch = (index+1)+'/'+mfId;
+
+            requestQueue.push(collection.fetch(fetchOptions));
+
             var lastItem = requestQueue.length - 1;
             // if data from local caching
             if (requestQueue[lastItem] === true) {
@@ -88,8 +98,8 @@
         }, this);
 
         // in case all requests came from local caching
-        if ((_.size(requestQueue) === 0) && (callbacks.success)) {
-            callbacks.success(allResponses);
+        if ((_.size(requestQueue) === 0) && (success)) {
+            return success(allResponses);
         }
     };
 
@@ -99,14 +109,16 @@
     /* -- APPLICATION ---------------------------------------------------------- */
     // Application Structure
     var Application = Monaco.Application = function(options) {
-        this.models      = {};        // model list
-        this.collections = {};        // collection list
-        this.views       = {};        // views list
-        this.transitions = {};        // view transition list
+        this.model      = {};        // model list
+        this.collection = {};        // collection list
+        this.view       = {};        // views list
+        this.transition = {};        // view transition list
 
-        options = options || {};
+        this.settings   = {};
 
-        Monaco.dispatcher.trigger('application:build', this, options);
+        this.options    = options || {};
+
+        Monaco.dispatcher.trigger('application:build', this, this.options);
     };
 
     Application.prototype.start = function(options) {
@@ -119,16 +131,42 @@
         Backbone.history.start({pushState: options.pushState});
     };
 
-    Application.prototype.transitionTo = function(targetView, renderOptions, Transition) {
+    Application.prototype.transitionTo = function(targetView, options, Transition) {
         if (!targetView) {
             throw new Error('missing target view');
         }
-        var currentView = this.currentView || null;
-        Transition = Transition || this.DefaultTransition || Monaco.Transition;
-        var transition = new Transition(currentView, targetView);
-        this.currentView = transition.start(renderOptions);
+
+        var currentView = (this.currentView || null),
+            TransitionClass = Transition || this.DefaultTransition || Monaco.Transition,
+            transition = new TransitionClass(currentView, targetView);
+
+        this.currentView = transition.start(options);
     };
 
+    Application.prototype.get = function( key ) {
+        if ( _.has ( app.settings, key ) ) {
+            return app.settings[key];
+        }
+        // todo account for localStorage not being supported
+        var result = JSON.parse( window.localStorage.getItem( key ) );
+        if (result === null ) {
+            return void 0;
+        }
+        app.settings[key] = result;
+        return result;
+    };
+
+    Application.prototype.set = function ( key, value, persist ) {
+        persist = persist || false;
+        // account for localstorage not being supported
+        if ( key === void 0 || value === void 0) {
+            console.log('error setting app variable - key and value are both required parameters');
+        }
+        if ( persist ) {
+            window.localStorage.setItem( key, JSON.stringify( value ) );
+        }
+        app.settings[key] = value;
+    };
 
     /* -- ROUTER --------------------------------------------------------------- */
     // extended backbone router class
@@ -169,6 +207,7 @@
 
     Monaco.Collection = Backbone.Collection.extend({
         fetch : function(options) {
+            options = options || {};
             options.error = options.error || Monaco.Router.defaultError || void 0;
             return Backbone.Collection.prototype.fetch.apply(this, arguments);
         }
@@ -179,6 +218,7 @@
 
     Monaco.Model = Backbone.Model.extend({
         fetch : function(options) {
+            options = options || {};
             options.error = options.error || Monaco.Router.defaultError || void 0;
             return Backbone.Model.prototype.fetch.apply(this, arguments);
         }
@@ -200,12 +240,14 @@
                 render.apply(_self, arguments);
                 _self._render.apply(_self, arguments);
                 this.trigger('rendered', this);
+                return this;
             };
             var close = this.close || function() {};
             this.close = function() {
                 _self._close.apply(_self, arguments);
                 close.apply(_self, arguments);
                 this.trigger('closed', this);
+                return this;
             };
         },
 
@@ -238,7 +280,7 @@
 
         // default render method that renders the template by appending it to the `el`
         render : function(data) {
-            data = data || this.collection || this.model || null;
+            data = data || (this.collection ? this.collection.toJSON() : (this.model ? this.model.toJSON() : null));
             $(this.el).append(this.template(data));
             return this;
         },
@@ -255,12 +297,8 @@
         // remove view's DOM elements and unbind events linked with it
         // http://lostechies.com/derickbailey/2011/09/15/zombies-run-managing-page-transitions-in-backbone-apps/
         close : function() {
-            // this.remove(); // remove the HTML from the DOM - jQuery dependent
+            this.dispose();
             $(this.el).empty(); // remove all child nodes - jQuery dependent
-            this.unbind(); // unbind DOM and custom events
-            if (this.onClose) { // call onClose method if available
-                this.onClose();
-            }
         }
     });
 
@@ -271,7 +309,7 @@
         options = options || {};
         if (options.prefetched) {
             _.each(options.prefetched, function(value, key) {
-                Monaco.local._storageSet(key, 'data', value);
+                Monaco.local.set({ resource : key , models : []}, value);
             }, this);
             delete options.prefetched;
         }
@@ -291,69 +329,121 @@
 
         get : function(obj) {
             var isCollection = _.has(obj, 'models'),
-                resource = obj.resource || obj.collection.resource || null,
-                data = (isCollection) ? this._findCollection(resource, true) : this._findModel(resource, obj);
+                resource = (obj.resource || obj.collection.resource || null),
+                data = (isCollection ? this._getCollectionData(resource, true) : this._getModelData(resource, obj));
             if (data) {
-                return data; 
+                return (isCollection ? data.resp : data);
             }
             return false;
         },
 
         set : function(obj, data, expire) {
             var isCollection = _.has(obj, 'models'),
-                resource = obj.resource || obj.collection.resource || null;
-                localData = _.clone(data);
+                resource = obj.resource || obj.collection.resource || null,
+                localData = null;
 
             if (isCollection) {
-                this._setExpireTime(localData, expire);
-                this._storageSet(resource, 'data', localData);
+                localData = _.clone(data);
             } else {
-                // TODO: verify if it is working
-                local = this._addToStorage(resource, obj, localData);
+                var collectionData = this._getCollectionData(resource, false);
+                if (collectionData) {
+                    localData = collectionData.resp;
+                    this._addToCollection(localData, data);
+                } else {
+                    return false;
+                }
             }
-            if (this._memoryHas(resource) || isCollection) {
+
+            localData = this.compress(localData);
+            localData = this._setExpireTime(localData, expire);
+            this._storageSet(resource, 'data', localData);
+            if (isCollection || this._memoryHas(resource)) {
                 this._memorySet(resource, localData);
             }
+            return true;
         },
 
-        clear : function(resource, id) {
-            // remove a specific item from a cached resource
-            if (resource && id) { // todo
-                throw new Error('option not implemented yet');
+        // overwrite this method with your own implementation of data compression
+        compress : function(data) {
+            return data;
+        },
 
-            // removes a resource from the cached resources
-            } else if (resource) {
-                this._storageSet("", resource);
-                if (Monaco._memory[resource]) {
-                    delete Monaco._memory[resource];
-                    // Monaco._memory - {};
+        // overwrite this method with your own implementation of data decompression
+        decompress : function(data) {
+            return data;
+        },
+
+        // clear Monaco.local data from memory and local storage
+        clear : function(name, type) {
+            var keyList;
+
+            // removes one item (name#type) from the cached resources
+            if (name) {
+                // remove the itme from local storage
+                var key = this._getKey((type || 'data'), name);
+                root.localStorage.removeItem(key);
+
+                // update monaco's key list
+                if (arguments.length === 3) {
+                    // used on recursive calls
+                    keyList = arguments[2];
+                } else {
+                    keyList = JSON.parse(root.localStorage.getItem('monaco:keys')) || [];
+                }
+                keyList = _.without(keyList, key);
+                if (keyList.length === 0) {
+                    root.localStorage.removeItem('monaco:keys');
+                } else {
+                    root.localStorage.setItem('monaco:keys', JSON.stringify(keyList));
                 }
 
-            // removes all resources cached
-            } else {
-                root.localStorage.clear();
+                // remove the item from memory
+                if (this._memoryHas(name)) {
+                    delete Monaco._memory[name];
+                }
+                return keyList;
+            }
+
+            // removes all resources cached by monaco
+            else {
+                keyList = JSON.parse(root.localStorage.getItem('monaco:keys')) || [];
+                var resource = null,
+                    currentList = keyList;
+                for (var i = 0, j = keyList.length; i < j; i++) {
+                    resource = keyList[i].split('#');
+                    currentList = this.clear.call(this, resource[1], resource[0], currentList);
+                }
                 Monaco._memory = {};
             }
         },
 
         _storageGet : function(name, type) {
-            console.log('## look in storage');
+            console.log('## look-up : local storage');
             var result = root.localStorage.getItem(this._getKey((type || 'data'), name));
             return (result === undefined || result == "undefined" || result === null) ? null : JSON.parse(result);
         },
 
         _storageSet : function(name, type, data) {
-            console.log('## set in storage');
-            root.localStorage.setItem(this._getKey((type || 'data'), name), JSON.stringify(data));
+            console.log('## data set : storage');
+            // set monaco's key list
+            var key = this._getKey((type || 'data'), name),
+                keyList = JSON.parse(root.localStorage.getItem('monaco:keys')) || [];
+            if (keyList.indexOf(key) < 0) {
+                keyList.push(key);
+            }
+            root.localStorage.setItem('monaco:keys', JSON.stringify(keyList));
+
+            // set the item
+            root.localStorage.setItem(key, JSON.stringify(data));
         },
 
         _memoryGet : function(resource) {
-            console.log('## look in memory');
+            console.log('## look-up : memory');
             return (Monaco._memory) ? Monaco._memory[resource] : null;
         },
 
         _memorySet : function(resource, data) {
-            console.log('## set in memory');
+            console.log('## data set : memory');
             Monaco._memory = {};
             Monaco._memory[resource] = data;
         },
@@ -369,40 +459,66 @@
                 date.setMinutes(date.getMinutes() + (expire || this.defaultExpire));
                 timestamp = date.getTime();
             }
-            data.unshift({timestamp: timestamp});
-            // no need to return data, since the reference-value manipulated one of its items
+            return {
+                timestamp : timestamp,
+                resp : data
+            };
         },
 
         _isExpired : function(data) {
-            var expire = data[0].timestamp,
+            var expire = data.timestamp,
                 now = new Date();
             return (!_.isNull(expire) && now.getTime() > expire);
         },
 
-        _findCollection : function(resource, collectionLookup) {
+        /*
+         * tries to get a collection data from any available caching layer (memory/localStorage)
+         *
+         * @param   string      resource            resource used to create the entry key
+         * @param   boolean     collectionLookup    flag indicating if this method is being called 
+         *                                          direct from a collection look-up or not
+         * @return  mixed                           an object with collection data if it is found and
+         *                                          data is not expired; null otherwise
+         */
+        _getCollectionData : function(resource, collectionLookup) {
             var caching = ['memory', 'storage'];
 
-            for (var i = 0, j = caching.length; i < j; i++) {
-                var local = this['_'+caching[i]+'Get'](resource);
-                if (local && ! this._isExpired(local)) {
-                    if (caching[i] == 'storage' && collectionLookup) {
-                        this._memorySet(resource, local);
+            for ( var i = 0, j = caching.length; i < j; i++ ) {
+                var localData = this['_'+caching[i]+'Get']( resource );
+                if (localData && ! this._isExpired(localData)) {
+                    var local = _.clone(localData);
+                    if (caching[i] === 'storage' && collectionLookup) {
+                        this._memorySet(resource, localData);
                     }
-                    return local.slice(1); // remove the timestamp
+                    local.resp = this.decompress(local.resp);
+                    return local;
                 }
             }
 
             return null;
         },
 
-        _findModel : function(resource, obj) {
-            var local = this._findCollection(resource, false);
-            if (local) {
-                local = _.find(local, function(item) {
-                    return item.id === obj.attributes.id;
+        /*
+         * tries to get a model data from any available caching layer (memory/localStorage)
+         *
+         * @param   string      resource            resource used to create the entry key
+         * @param   object      model               model object containing at least the id attribute
+         * @return  mixed                           an object with collection data if it is found and
+         *                                          data is not expired; null otherwise
+         */
+        _getModelData : function(resource, model) {
+            // This implementation is limited to collection responses containing array of model items
+            // or to collection responses as an object where a key matching with the collection resource
+            // name has an array of model items
+            var localCollection = this._getCollectionData(resource, false),
+                localModel = null,
+                key = resource.split('.')[0];
+            if (localCollection) {
+                localModel = _.find((localCollection.resp[key] || localCollection.resp), function(item) {
+                    return item.id === model.get('id');
                 }, this);
             }
-            return local;
+            return localModel;
         },
 
         _addToStorage : function(resource, model, data) {
@@ -539,14 +655,34 @@
         //      transition from A (current view) to B (target view)
         //      close current view A
         //      return the new view (!important)
-        start : function(renderOptions) {
-            this.toView.render(renderOptions);
-            if (this.fromView) {
+        start : function(options) {
+            options = options || {};
+            if (this.fromView && this.toView.el === this.fromView.el) {
                 this.fromView.close();
+                this.toView.render(options);
+            }
+            else if (this.fromView) {
+                this.toView.render(options);
+                this.fromView.close();
+            } else {
+                this.toView.render(options);
+            }
+            if (_.has(options, 'scrollTop')) {
+                window.scrollTo(0, options.scrollTop);
             }
             return this.toView;
         }
     });
 
     Application.extend = Form.extend = Transition.extend = extend;
+
+    // Certain Android devices are having issues when a JSON.parse(null) call is executed.
+    // the following should fix this bug 
+    JSON.originalParse = JSON.parse;
+    JSON.parse = function(text) {
+        if (text) {
+            return JSON.originalParse(text);
+        }
+        return null;
+    };
 }(window));
